@@ -11,12 +11,21 @@
 
 const ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESCAPE_RE = /[&<>"']/g;
-const ESCAPE_TEST = /[&<>"']/;
 
 /** `text` with & < > " and ' replaced by their HTML entities. */
 function escapeHtml(text) {
-  // most pieces hold nothing to escape: a test scan is cheaper than replace
-  return ESCAPE_TEST.test(text) ? text.replace(ESCAPE_RE, (c) => ESCAPE_MAP[c]) : text;
+  // one hopping scan; the pieces between specials are copied in bulk and a
+  // text with nothing to escape comes back as itself
+  ESCAPE_RE.lastIndex = 0;
+  let m = ESCAPE_RE.exec(text);
+  if (m === null) return text;
+  let out = '';
+  let last = 0;
+  do {
+    out += text.slice(last, m.index) + ESCAPE_MAP[m[0]];
+    last = m.index + 1;
+  } while ((m = ESCAPE_RE.exec(text)) !== null);
+  return out + text.slice(last);
 }
 
 const SLUG_MAX = 64;
@@ -313,9 +322,41 @@ function isContinuation(line) {
   return n >= 2 && n < line.length && !isWsCode(line.charCodeAt(n));
 }
 
+/** Whether `line` opens a fence, without slicing out the language. */
+function isFenceOpen(line) {
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
+  let i = 3;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) i++;
+    else break;
+  }
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+    i++;
+  }
+  return true;
+}
+
+/** Whether `line` is a heading, without slicing out its text. */
+function isHeading(line) {
+  let n = 0;
+  while (line.charCodeAt(n) === 35) n++;
+  if (n < 1 || n > 6) return false;
+  const c = line.charCodeAt(n);
+  if (c !== 32 && c !== 9) return false;
+  while (n < line.length) {
+    const cc = line.charCodeAt(n);
+    if (cc !== 32 && cc !== 9) return true;
+    n++;
+  }
+  return false;
+}
+
 /** Whether `line` ends a paragraph: blank, a fence opening, a heading or a thematic break. */
 function endsParagraph(line) {
-  return isBlankLine(line) || fenceOpenLang(line) !== null || headingOf(line) !== null || isBreak(line);
+  return isBlankLine(line) || isFenceOpen(line) || isHeading(line) || isBreak(line);
 }
 
 /** The characters a backslash escapes, by code unit: \ ` * _ [ ] ( ) # + - . ! > */
@@ -484,11 +525,11 @@ function renderMarkdown(src, link, slugOf) {
     if (isBlankLine(line)) { i++; continue; }
     const lang = fenceOpenLang(line);
     if (lang !== null) {
-      let body = '';
+      parts.push('<pre><code' + (lang === '' ? '' : ` class="language-${lang}"`) + '>');
       i++;
-      while (i < n && !isFenceClose(lines[i])) { body += escapeHtml(lines[i]) + '\n'; i++; }
+      while (i < n && !isFenceClose(lines[i])) { parts.push(escapeHtml(lines[i])); parts.push('\n'); i++; }
       i++;
-      parts.push('<pre><code' + (lang === '' ? '' : ` class="language-${lang}"`) + '>' + body + '</code></pre>\n');
+      parts.push('</code></pre>\n');
       continue;
     }
     const heading = headingOf(line);
@@ -695,6 +736,23 @@ function isTruthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+/** The value of the one-segment `path` in the scope chain (the common lookup, inlined at its hot call sites). */
+function lookupHead(scope, key) {
+  let s = scope;
+  while (s !== null && !Object.hasOwn(s.vars, key)) s = s.parent;
+  return s === null ? undefined : s.vars[key];
+}
+
+/** The value at `path` in the scope chain, with the one- and two-segment paths taken directly. */
+function lookupFast(scope, path) {
+  if (path.length === 1) return lookupHead(scope, path[0]);
+  if (path.length === 2) {
+    const v = lookupHead(scope, path[0]);
+    return v === null || typeof v !== 'object' || !Object.hasOwn(v, path[1]) ? undefined : v[path[1]];
+  }
+  return lookupPath(scope, path);
+}
+
 /** `nodes` rendered into the `out` array of string pieces, in `scope`, with `ctx.templates` for includes. */
 function renderNodes(nodes, scope, ctx, depth, out) {
   for (let idx = 0; idx < nodes.length; idx++) {
@@ -704,10 +762,10 @@ function renderNodes(nodes, scope, ctx, depth, out) {
         out.push(nd.text);
         break;
       case 1: // var
-        out.push(escapeHtml(textOfValue(lookupPath(scope, nd.path))));
+        out.push(escapeHtml(textOfValue(lookupFast(scope, nd.path))));
         break;
       case 2: // raw
-        out.push(textOfValue(lookupPath(scope, nd.path)));
+        out.push(textOfValue(lookupFast(scope, nd.path)));
         break;
       case 3: { // if
         const v = isTruthy(lookupPath(scope, nd.path));
@@ -718,23 +776,135 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       case 4: { // for
         const xs = lookupPath(scope, nd.path);
         if (Array.isArray(xs)) {
-          for (let k = 0; k < xs.length; k++) {
-            const vars = {
-              [nd.name]: xs[k],
-              loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length },
-            };
-            renderNodes(nd.body, { vars, parent: scope }, ctx, depth, out);
+          // one scope, vars object and loop object per execution of this
+          // node, their previous contents saved and restored around each
+          // item's render (the node can be re-entered through an include)
+          if (nd.scope === undefined) {
+            nd.scope = { vars: {}, parent: null };
+            nd.loop = { index: 0, first: false, last: false, length: 0 };
           }
+          const vars = nd.scope.vars;
+          const loop = nd.loop;
+          const hadItem = Object.hasOwn(vars, nd.name);
+          const prevItem = vars[nd.name];
+          const hadLoop = Object.hasOwn(vars, 'loop');
+          const prevLoop = vars.loop;
+          const prevParent = nd.scope.parent;
+          const prevIndex = loop.index, prevFirst = loop.first, prevLast = loop.last, prevLength = loop.length;
+          nd.scope.parent = scope;
+          vars.loop = loop;
+          loop.length = xs.length;
+          for (let k = 0; k < xs.length; k++) {
+            // a variable named "loop" is shadowed by the loop info, exactly
+            // as in a fresh { [name]: item, loop: {...} } object per item
+            if (nd.name !== 'loop') vars[nd.name] = xs[k];
+            loop.index = k + 1;
+            loop.first = k === 0;
+            loop.last = k === xs.length - 1;
+            renderNodes(nd.body, nd.scope, ctx, depth, out);
+          }
+          if (hadItem) vars[nd.name] = prevItem; else delete vars[nd.name];
+          if (hadLoop) vars.loop = prevLoop; else delete vars.loop;
+          nd.scope.parent = prevParent;
+          loop.index = prevIndex; loop.first = prevFirst; loop.last = prevLast; loop.length = prevLength;
         }
         break;
       }
       case 5: { // include
         const t = ctx.templates.get(nd.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+        if (t !== undefined && depth < INCLUDE_DEPTH) {
+          const heads = ctx.constHeads.get(nd.name);
+          if (heads !== undefined) {
+            // a build-constant include (it reads only root-scope values):
+            // the string it renders at a given depth is the same in every
+            // scope whose chain resolves those heads to the root values
+            let ok = true;
+            for (let k = 0; k < heads.length; k++) {
+              if (lookupHead(scope, heads[k]) !== ctx.rootVars[heads[k]]) { ok = false; break; }
+            }
+            if (ok) {
+              const key = nd.name + '@' + (depth + 1);
+              let s = ctx.constCache.get(key);
+              if (s === undefined) {
+                const tmp = [];
+                renderNodes(t, scope, ctx, depth + 1, tmp);
+                s = tmp.join('');
+                ctx.constCache.set(key, s);
+              }
+              out.push(s);
+              break;
+            }
+          }
+          renderNodes(t, scope, ctx, depth + 1, out);
+        }
         break;
       }
     }
   }
+}
+
+/**
+ * The free path heads of a node list: the first segment of every path it
+ * reads that no enclosing for in the list binds, plus one "\0include:<name>"
+ * marker per include, for the caller to resolve transitively.
+ */
+function collectHeads(nodes, bound, out) {
+  for (const nd of nodes) {
+    switch (nd.kind) {
+      case 1:
+      case 2:
+        if (!bound.has(nd.path[0])) out.add(nd.path[0]);
+        break;
+      case 3:
+        if (!bound.has(nd.path[0])) out.add(nd.path[0]);
+        collectHeads(nd.then, bound, out);
+        if (nd.else !== null) collectHeads(nd.else, bound, out);
+        break;
+      case 4: {
+        if (!bound.has(nd.path[0])) out.add(nd.path[0]);
+        const inner = new Set(bound);
+        inner.add(nd.name);
+        inner.add('loop');
+        collectHeads(nd.body, inner, out);
+        break;
+      }
+      case 5:
+        out.add('\0include:' + nd.name);
+        break;
+    }
+  }
+}
+
+/**
+ * Each parsed template's free heads, with include markers expanded through
+ * the included templates (to a fixpoint, so include cycles are safe). An
+ * include of a template that does not parse contributes no heads: it renders
+ * nothing.
+ */
+function freeHeadsByTemplate(templates) {
+  const byName = new Map();
+  for (const [name, nodes] of templates) {
+    const heads = new Set();
+    collectHeads(nodes, new Set(), heads);
+    byName.set(name, heads);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const heads of byName.values()) {
+      for (const h of [...heads]) {
+        if (h.charCodeAt(0) !== 0) continue;
+        const target = byName.get(h.slice(9));
+        if (target !== undefined) {
+          for (const x of target) if (!heads.has(x)) { heads.add(x); changed = true; }
+        }
+      }
+    }
+  }
+  for (const heads of byName.values()) {
+    for (const h of [...heads]) if (h.charCodeAt(0) === 0) heads.delete(h);
+  }
+  return byName;
 }
 
 // ---------------------------------------------------------------- the build
@@ -840,32 +1010,43 @@ function build(input) {
   // Markdown, with each source's links resolved against the built pages and static files
   const broken = new Set();
   const staticPaths = new Set(statics.map((f) => f.path));
+  // a link's resolution depends only on its directory and target, and links
+  // repeat across sources (navigation, footers): resolve each pair once for
+  // the whole build; the broken report itself stays per source
+  const BROKEN = {};
+  const resolveCache = new Map();
+  const dirPartsByDir = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
-    const dirParts = dir === '' ? [] : dir.split('/');
+    let dirParts = dirPartsByDir.get(dir);
+    if (dirParts === undefined) {
+      dirParts = dir === '' ? [] : dir.split('/');
+      dirPartsByDir.set(dir, dirParts);
+    }
     const sourcePath = s.path;
-    // a source's links repeat (navigation, footers): resolve each target once
-    const linkCache = new Map();
+    const keyPrefix = dir + '\0';
     const link = (target) => {
-      const hit = linkCache.get(target);
-      if (hit !== undefined) return hit;
-      let result;
-      if (LINK_SCHEME.test(target) || target.startsWith('/') || target.startsWith('#')) {
-        result = target;
-      } else {
-        const hash = target.indexOf('#');
-        const rel = hash === -1 ? target : target.slice(0, hash);
-        const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dirParts, rel);
-        if (path !== null && bySource.has(path)) result = bySource.get(path).url + frag;
-        else if (path !== null && staticPaths.has(path)) result = `${base}/${path}${frag}`;
-        else {
-          broken.add(`broken-link ${sourcePath} -> ${target}`);
-          result = target;
+      const key = keyPrefix + target;
+      let outcome = resolveCache.get(key);
+      if (outcome === undefined) {
+        if (LINK_SCHEME.test(target) || target.startsWith('/') || target.startsWith('#')) {
+          outcome = target;
+        } else {
+          const hash = target.indexOf('#');
+          const rel = hash === -1 ? target : target.slice(0, hash);
+          const frag = hash === -1 ? '' : target.slice(hash);
+          const path = rel === '' ? null : resolvePath(dirParts, rel);
+          if (path !== null && bySource.has(path)) outcome = bySource.get(path).url + frag;
+          else if (path !== null && staticPaths.has(path)) outcome = `${base}/${path}${frag}`;
+          else outcome = BROKEN;
         }
+        resolveCache.set(key, outcome);
       }
-      linkCache.set(target, result);
-      return result;
+      if (outcome === BROKEN) {
+        broken.add(`broken-link ${sourcePath} -> ${target}`);
+        return target;
+      }
+      return outcome;
     };
     const md = renderMarkdown(s.body, link, slugOf);
     s.html = md.html;
@@ -918,13 +1099,24 @@ function build(input) {
   }
   const tagList = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
+  // dates repeat across cards and neighbour links: spell each one out once
+  const dateCache = new Map();
+  const longDateOf = (date) => {
+    let v = dateCache.get(date);
+    if (v === undefined) {
+      v = longDate(date);
+      dateCache.set(date, v);
+    }
+    return v;
+  };
+
   // cards, computed once per source
   for (const s of kept) {
     s.card = {
       title: s.data.title,
       url: s.url,
       date: s.data.date ?? '',
-      date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+      date_long: s.data.date === undefined ? '' : longDateOf(s.data.date),
       summary: s.data.summary ?? '',
       excerpt: s.excerpt,
       reading_minutes: Math.max(1, Math.ceil(countWords(s.body) / 200)),
@@ -935,29 +1127,50 @@ function build(input) {
     title: s.data.title,
     url: s.url,
     date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+    date_long: s.data.date === undefined ? '' : longDateOf(s.data.date),
   });
-  const pageOf = (s) => ({
-    ...s.card,
-    slug: s.slug,
-    content: s.html,
-    toc: s.toc,
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
-    is_post: s.post,
-  });
+  const pageOf = (s) => {
+    const c = s.card;
+    return {
+      title: c.title,
+      url: c.url,
+      date: c.date,
+      date_long: c.date_long,
+      summary: c.summary,
+      excerpt: c.excerpt,
+      reading_minutes: c.reading_minutes,
+      tags: c.tags,
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc,
+      newer: linkOf(s.newer ?? null),
+      older: linkOf(s.older ?? null),
+      is_post: s.post,
+    };
+  };
 
   // layouts: every page, the index pages, the tag pages, then the static files
   const output = {};
   const site = { title: input.site.title, base_url: base };
   const allTags = tagList.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => p.card);
-  const ctx = { templates };
+  // templates that read only root-scope values render the same string on
+  // every page: mark them so their includes can reuse one render per depth
+  const constHeads = new Map();
+  for (const [name, heads] of freeHeadsByTemplate(templates)) {
+    let constant = true;
+    for (const h of heads) {
+      if (h !== 'site' && h !== 'tags' && h !== 'recent') { constant = false; break; }
+    }
+    if (constant) constHeads.set(name, [...heads]);
+  }
+  const ctx = { templates, constHeads, constCache: new Map(), rootVars: null };
   // the root scope is shared by every render of this build; each render's own
   // values sit in a child scope in front of it (their keys — page, posts,
   // pager, tag — never collide with site, tags or recent, so lookups resolve
   // exactly as they would in one merged scope)
   const rootScope = { vars: { site, tags: allTags, recent }, parent: null };
+  ctx.rootVars = rootScope.vars;
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
